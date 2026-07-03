@@ -1,0 +1,134 @@
+// ============================================================
+// PHASE 2 - OnAdd_PatientDeduplication_CRMSync
+// Trigger: Appointment_Request -> Created -> On Success
+// Platform: Zoho Creator (Deluge)
+// ============================================================
+//
+// STATUS: Abandoned in favor of Zoho Flow.
+// Kept here as reference documentation of the approach evaluated
+// before the integration logic was rebuilt in
+// /flow/Creator_To_CRM_Appointment_Sync.flow
+//
+// Reason for abandoning: repeated instability in Creator's newer
+// Deluge workflow builder editor made this workflow unreliable to
+// edit and test. During review for this repository, three
+// additional issues were identified and are annotated below —
+// these would have needed fixing regardless of the editor problems.
+//
+// ============================================================
+
+// --- 1. READ FORM VALUES ---
+v_email = input.Email.toLower();
+v_phone = input.Phone.replaceAll(" ", "").replaceAll("-", "");
+v_first_name = input.Patient_First_Name;
+v_last_name = input.Patient_Last_Name;
+v_dob = input.Date_of_Birth;
+v_appt_date = input.Appointment_Date;
+v_specialty = input.Specialty;
+v_branch = input.Branch;
+v_reason = input.Reason_for_Visit;
+v_insurance = input.Insurance_Provider;
+v_record_id = input.ID;
+
+// --- 2. DEDUPLICATION CHECK (email first, then phone) ---
+// NOTE (fixed): zoho.crm.searchRecords criteria must be wrapped in
+// parentheses for API v2, e.g. "(Email:equals:value)". The original
+// version omitted them, which can fail silently or throw depending
+// on the API version in use.
+v_duplicate_found = false;
+v_existing_crm_id = "";
+
+search_by_email = zoho.crm.searchRecords("Contacts", "(Email:equals:" + v_email + ")");
+if(search_by_email.size() > 0)
+{
+	v_duplicate_found = true;
+	v_existing_crm_id = search_by_email.get(0).get("id").toString();
+}
+else
+{
+	search_by_phone = zoho.crm.searchRecords("Contacts", "(Phone:equals:" + v_phone + ")");
+	if(search_by_phone.size() > 0)
+	{
+		v_duplicate_found = true;
+		v_existing_crm_id = search_by_phone.get(0).get("id").toString();
+	}
+}
+
+// --- 3A. DUPLICATE PATH - update Creator record and flag ---
+if(v_duplicate_found)
+{
+	update_map = map();
+	update_map.put("CRM_Contact_ID", v_existing_crm_id);
+	update_map.put("Patient_ID", "DUPLICATE-" + v_existing_crm_id);
+	update_map.put("Appointment_Status", "Scheduled");
+	zoho.creator.updateRecord("yarecasst", "clinicappointmentsystem", "Appointment_Request", v_record_id, update_map);
+}
+else
+{
+	// --- 3B. NEW PATIENT PATH ---
+
+	// Generate a Patient ID: CLI-YYYY-XXXX
+	// NOTE (fixed): zoho.currentdate.getYear() is not a valid Deluge
+	// method. The correct call is zoho.currentdate.toString("yyyy").
+	v_year = zoho.currentdate.toString("yyyy");
+
+	// NOTE (design issue, not fixed here): using getRecordCount() as
+	// a sequence number is a race condition. Two near-simultaneous
+	// submissions can read the same count before either write
+	// completes, producing a duplicate Patient_ID. A safer approach
+	// is a dedicated auto-increment field in Creator, or a counter
+	// record read-and-incremented inside a single transaction. Left
+	// as-is here since this workflow was not taken to production.
+	v_sequence = zoho.creator.getRecordCount("yarecasst", "clinicappointmentsystem", "Appointment_Request", "").toString();
+	v_padded = v_sequence.leftPad(4, "0");
+	v_patient_id = "CLI-" + v_year + "-" + v_padded;
+
+	// --- 4. BRANCH ASSIGNMENT LOGIC ---
+	v_assigned_branch = v_branch;
+	if(v_branch == "" || v_branch == null)
+	{
+		// Default fallback if branch not selected
+		v_assigned_branch = "Branch_A_CDMX";
+	}
+
+	// --- 5. CREATE CONTACT IN ZOHO CRM ---
+	contact_data = map();
+	contact_data.put("First_Name", v_first_name);
+	contact_data.put("Last_Name", v_last_name);
+	contact_data.put("Email", v_email);
+	contact_data.put("Phone", v_phone);
+	contact_data.put("Birthdate", v_dob);
+	contact_data.put("Patient_ID", v_patient_id);
+	contact_data.put("Home_Branch", v_assigned_branch);
+	contact_data.put("Patient_Status", "Lead");
+	contact_data.put("Insurance_Provider", v_insurance);
+	contact_data.put("Lead_Source", "Zoho Creator - Appointment");
+	contact_data.put("Description", v_reason);
+
+	crm_contact_response = zoho.crm.createRecord("Contacts", contact_data);
+	v_new_crm_contact_id = crm_contact_response.get("id").toString();
+
+	// --- 6. CREATE DEAL IN ZOHO CRM ---
+	v_deal_name = v_first_name + " " + v_last_name + " - " + v_specialty + " - " + v_appt_date.toString("dd/MM/yyyy");
+
+	deal_data = map();
+	deal_data.put("Deal_Name", v_deal_name);
+	deal_data.put("Contact_Name", v_new_crm_contact_id);
+	deal_data.put("Stage", "Appointment Booked");
+	deal_data.put("Closing_Date", v_appt_date);
+	deal_data.put("Appointment_Date", v_appt_date);
+	deal_data.put("Specialty", v_specialty);
+	deal_data.put("Branch", v_assigned_branch);
+	deal_data.put("Creator_Record_ID", v_record_id.toString());
+	deal_data.put("Appointment_Status", "Scheduled");
+
+	crm_deal_response = zoho.crm.createRecord("Deals", deal_data);
+
+	// --- 7. UPDATE CREATOR RECORD WITH CRM IDs ---
+	update_map2 = map();
+	update_map2.put("Patient_ID", v_patient_id);
+	update_map2.put("CRM_Contact_ID", v_new_crm_contact_id);
+	update_map2.put("Created_By_Branch", v_assigned_branch);
+	update_map2.put("Appointment_Status", "Scheduled");
+	zoho.creator.updateRecord("yarecasst", "clinicappointmentsystem", "Appointment_Request", v_record_id, update_map2);
+}
